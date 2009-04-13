@@ -5,7 +5,11 @@ use Encode::HanConvert;
 use Getopt::Long;
 use MP3::Tag;
 
-my ($noconfirm, $s2t, $t2s, $b2t, $g2t);
+binmode STDOUT, ":utf8"; 
+
+my ($do_confirm, $noconfirm, $s2t, $t2s, $b2t, $g2t);
+my @frame_ids = qw(TIT2 TPE1 TPE2 TALB TCON COMM USLT); # title artist album_artist album genre comment lyrics
+
 GetOptions(
     "noconfirm" => \$noconfirm,
     "s2t"       => \$s2t,
@@ -15,6 +19,13 @@ GetOptions(
 );
 
 usage() unless ($ARGV[0]);
+
+$do_confirm = ($noconfirm) ? 0 : 1;
+if    ($t2s) { *convert = \&trad_to_simp; }
+elsif ($g2t) { *convert = \&gb_to_trad;   }
+elsif ($b2t) { *convert = \&big5_to_trad; }
+elsif ($s2t) { *convert = \&simp_to_trad; }
+else         { *convert = \&simp_to_trad; }
 
 sub usage
 {
@@ -29,123 +40,115 @@ Usage: $script [--noconfirm] [--s2t] [--t2s] [--g2t] [--b2t] file1 [file2] ... [
     --b2t       - convert Big5 to Unicode Traditional
 
 EOF
-    die $usage;
+    print STDERR $usage;
+    exit 1;
 }
 
-if ($t2s) {
-    *convert = \&trad_to_simp;
-} elsif ($g2t) {
-    *convert = \&gb_to_trad;
-} elsif ($b2t) {
-    *convert = \&big5_to_trad;
-} else { ## s2t
-    *convert = \&simp_to_trad;
-}
-
-binmode STDOUT, ":utf8";
-
-my @tags = qw(artist album title track comment );
-#my @tags = qw(comment );
-my @v2_frames = qw(TIT2 TPE1 TPE2 TALB COMM USLT);
-my $new_method = 1;
-
-foreach my $file (@ARGV)
+sub trim
 {
-    eval
-    {
-        #print "calling process_file\n";
-        process_file($file);
-    };
-    if ($@)
-    {
-        print "error: $@\n";
-        next;
-    }
+    my ($str, $maxlen) = @_;
+    $maxlen ||= 40;
+    return (length($str) > $maxlen) ? substr($str, 0, $maxlen) . '...' : $str;
+}
+
+sub strip_cr
+{
+    my $str = shift;
+    $str =~ s/\r//g;
+    $str =~ s/\n/ /g;
+    return $str;
+}
+
+sub error
+{
+    print STDERR shift;
+    exit 2;
 }
 
 sub process_file
 {
     my ($file) = @_;
+    my ($mp3, $id3v2, @converted_frame_ids);
     my (%old, %new);
-    my ($mp3, $id3v2);
+
+    error "process_file: $file is a directory.\n" if (-d $file);
+    error "process_file: $file doesn't exist.\n" unless (-f $file);
 
     $mp3 = MP3::Tag->new($file);
     $mp3->get_tags;
+    $id3v2 = $mp3->{ID3v2};
 
-    %old = %{$mp3->autoinfo()};
+    next unless $id3v2;
 
-    if ($new_method)
+    foreach my $frame_id (@frame_ids)
     {
-        foreach my $tag (@tags)
+        my ($frame_value, $frame_name) = $id3v2->get_frame($frame_id);
+
+        next unless $frame_value;
+
+        if (ref $frame_value)
         {
-            $new{$tag} = convert($old{$tag});
-            print "$tag: [$old{$tag}] => [$new{$tag}]\n";
-        }
-    }
-    else
-    {
-        next unless (exists $mp3->{ID3v2});
+            ## only process comments and lyrics
+            next unless ($frame_id eq 'COMM' || $frame_id eq 'USLT');
 
-        $id3v2 = $mp3->{ID3v2};
+            ## skip special comments like iTunNORM
+            next if ($frame_value->{Description});
 
-        my (%old, %new);
-        foreach my $frame (@v2_frames)
-        {
-            my ($frame_value, $info) = $id3v2->get_frame($frame);
-            $old{$frame} = $frame_value;
-            $new{$frame} = convert($frame_value);
+            ## fetch the frame with the given $frame_id based on the given language priority
+            my $frame_select_value = $id3v2->frame_select($frame_id, '', ['chi', 'eng', '']);
 
-            print "$frame (old) => $old{$frame}\n";
-            print "$frame (new) => $new{$frame}\n";
-        }
-    }
+            $old{$frame_id} = $frame_select_value;
+            $new{$frame_id} = convert($frame_select_value);
+            printf "$frame_name ($frame_id): [%s] => [%s]\n", trim(strip_cr($old{$frame_id})), trim(strip_cr($new{$frame_id}));
+            my $new_lang = ($frame_id eq 'COMM') ? 'eng' : $frame_value->{Language};  # iTunes workaround
 
-    my $do_convert = 'Y';
-    if (!$noconfirm)
-    {
-        print "Convert? [y/N] ";
-        $do_convert = <STDIN>;
-        chomp($do_convert);
-    }
-
-    if (uc($do_convert) eq 'Y')
-    {
-        if ($new_method)
-        {
-            if (exists $mp3->{ID3v2})
-            {
-                $id3v2 = $mp3->{ID3v2};
-                $id3v2->change_frame('TPE1', $new{artist});
-                $id3v2->change_frame('TALB', $new{album});
-                $id3v2->change_frame('TIT2', $new{title});
-                $id3v2->change_frame('COMM', $new{comment});
-                $id3v2->write_tag();
-            }
-            else
-            {
-                $mp3->new_tag('ID3v2');
-
-                $mp3->{ID3v2}->add_frame('TPE1', $new{artist});
-                $mp3->{ID3v2}->add_frame('TALB', $new{album});
-                $mp3->{ID3v2}->add_frame('TIT2', $new{title});
-                $mp3->{ID3v2}->add_frame('COMM', $new{comment});
-
-                #$mp3->{ID3v2}->add_frame('TRCK', $old{track});
-                #$mp3->{ID3v2}->add_frame('GNRE', $old{genre});
-                #$mp3->{ID3v2}->add_frame('YEAR', $old{year});
-
-                $mp3->{ID3v2}->write_tag;
-            }
+            ## removed other found frames and add/replace existing frame using $new_lang
+            my $frames_affected = $id3v2->frame_select($frame_id, '', [$new_lang, 'chi', 'eng', ''], $new{$frame_id});
+            print "frames_affected=$frames_affected\n";
         }
         else
         {
-            foreach my $frame (@v2_frames)
-            {
-                $id3v2->change_frame($frame, $new{$frame});
-            }
-            $id3v2->write_tag();
+            $old{$frame_id} = $frame_value;
+            $new{$frame_id} = convert($frame_value);
+
+            printf "$frame_name ($frame_id):\n  [%s] => [%s]\n", $old{$frame_id}, $new{$frame_id};
+
+            $id3v2->change_frame($frame_id, $new{$frame_id});
         }
+
+        push(@converted_frame_ids, $frame_id);
     }
+
+    my $do_convert = 1;
+    if ($do_confirm)
+    {
+        print "Convert? [y/N] ";
+        my $reply = <STDIN>;
+        chomp($reply);
+        $do_convert = (uc($reply) eq 'Y') ? 1 : 0;
+    }
+
+    $id3v2->write_tag() if ($do_convert);
 
     $mp3->close();
 }
+
+sub main
+{
+    foreach my $file (@ARGV)
+    {
+        eval
+        {
+            #print "calling process_file\n";
+            process_file($file);
+        };
+        if ($@)
+        {
+            print "error: $@\n";
+            next;
+        }
+    }
+}
+
+main();
+exit 0;
