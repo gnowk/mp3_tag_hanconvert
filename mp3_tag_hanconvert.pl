@@ -7,8 +7,7 @@ use MP3::Tag;
 
 binmode STDOUT, ":utf8"; 
 
-my ($do_confirm, $noconfirm, $s2t, $t2s, $b2t, $g2t);
-my @frame_ids = qw(TIT2 TPE1 TPE2 TALB TCON COMM USLT); # title artist album_artist album genre comment lyrics
+my ($do_confirm, $noconfirm, $s2t, $t2s, $b2t, $g2t, $debug);
 
 GetOptions(
     "noconfirm" => \$noconfirm,
@@ -16,6 +15,7 @@ GetOptions(
     "t2s"       => \$t2s,
     "b2t"       => \$b2t,
     "g2t"       => \$g2t,
+    "debug"     => \$debug,
 );
 
 usage() unless ($ARGV[0]);
@@ -44,19 +44,9 @@ EOF
     exit 1;
 }
 
-sub trim
+sub debug
 {
-    my ($str, $maxlen) = @_;
-    $maxlen ||= 40;
-    return (length($str) > $maxlen) ? substr($str, 0, $maxlen) . '...' : $str;
-}
-
-sub strip_cr
-{
-    my $str = shift;
-    $str =~ s/\r//g;
-    $str =~ s/\n/ /g;
-    return $str;
+    print STDERR shift if $debug;
 }
 
 sub error
@@ -75,48 +65,19 @@ sub process_file
     error "process_file: $file doesn't exist.\n" unless (-f $file);
 
     $mp3 = MP3::Tag->new($file);
-    $mp3->get_tags;
-    $id3v2 = $mp3->{ID3v2};
 
-    next unless $id3v2;
+    # hashref of tag values (e.g. { title => 'Kids', artist => 'MGMT', ... })
+    my $values = $mp3->autoinfo();
 
-    foreach my $frame_id (@frame_ids)
+    # generated hashref of tag values
+    my $converted_values = { map { $_ => convert($values->{$_}) } keys(%{$values}) }; 
+
+    foreach my $field qw(title artist album comment)
     {
-        my ($frame_value, $frame_name) = $id3v2->get_frame($frame_id);
-
-        next unless $frame_value;
-
-        if (ref $frame_value)
+        if ($values->{$field})
         {
-            ## only process comments and lyrics
-            next unless ($frame_id eq 'COMM' || $frame_id eq 'USLT');
-
-            ## skip special comments like iTunNORM
-            next if ($frame_value->{Description});
-
-            ## fetch the frame with the given $frame_id based on the given language priority
-            my $frame_select_value = $id3v2->frame_select($frame_id, '', ['chi', 'eng', '']);
-
-            $old{$frame_id} = $frame_select_value;
-            $new{$frame_id} = convert($frame_select_value);
-            printf "$frame_name ($frame_id): [%s] => [%s]\n", trim(strip_cr($old{$frame_id})), trim(strip_cr($new{$frame_id}));
-            my $new_lang = ($frame_id eq 'COMM') ? 'eng' : $frame_value->{Language};  # iTunes workaround
-
-            ## removed other found frames and add/replace existing frame using $new_lang
-            my $frames_affected = $id3v2->frame_select($frame_id, '', [$new_lang, 'chi', 'eng', ''], $new{$frame_id});
-            print "frames_affected=$frames_affected\n";
+            printf "%s: [%s] => [%s]\n", $field, $values->{$field}, $converted_values->{$field};
         }
-        else
-        {
-            $old{$frame_id} = $frame_value;
-            $new{$frame_id} = convert($frame_value);
-
-            printf "$frame_name ($frame_id):\n  [%s] => [%s]\n", $old{$frame_id}, $new{$frame_id};
-
-            $id3v2->change_frame($frame_id, $new{$frame_id});
-        }
-
-        push(@converted_frame_ids, $frame_id);
     }
 
     my $do_convert = 1;
@@ -128,7 +89,7 @@ sub process_file
         $do_convert = (uc($reply) eq 'Y') ? 1 : 0;
     }
 
-    $id3v2->write_tag() if ($do_convert);
+    $mp3->update_tags($converted_values, 1) if ($do_convert);
 
     $mp3->close();
 }
@@ -139,12 +100,13 @@ sub main
     {
         eval
         {
-            #print "calling process_file\n";
+            debug "calling process_file\n";
             process_file($file);
+            debug "done process_file\n";
         };
         if ($@)
         {
-            print "error: $@\n";
+            print STDERR "error: $@\n";
             next;
         }
     }
